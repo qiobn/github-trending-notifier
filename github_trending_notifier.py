@@ -231,7 +231,7 @@ def main():
     yearly_repos = fetch_yearly_hot_repos(count=5)
     print(f"  随机选取 {len(yearly_repos)} 个年度热门项目")
 
-    # 3. AI 生成概要（每次调用间隔 4 秒，避免触发频率限制）
+    # 3. AI 生成概要（每次调用间隔 8 秒，避免触发智谱免费版频率限制）
     print("正在生成 AI 概要...")
     all_repos = trending_repos + yearly_repos
     for idx, repo in enumerate(all_repos):
@@ -239,7 +239,7 @@ def main():
         readme = fetch_readme(repo["name"])
         repo["summary"] = ai_summarize(repo["name"], repo["description"], readme)
         if idx < len(all_repos) - 1:
-            time.sleep(4)
+            time.sleep(8)
 
     # 4. 格式化并推送
     title, content = format_message(trending_repos, yearly_repos)
