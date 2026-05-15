@@ -2,10 +2,11 @@
 GitHub Trending 每日推送脚本
 - 抓取当天 GitHub Trending 前 10 个项目
 - 检索近一年热门项目随机推送 5 个
-- 使用 AI 生成中文概要（主要功能、技术栈、应用场景）
+- 使用 AI 批量生成中文概要（主要功能、技术栈、应用场景）
 - 通过 Server酱推送到微信
 """
 
+import json
 import os
 import random
 import sys
@@ -85,7 +86,9 @@ def fetch_yearly_hot_repos(count=5):
     if gh_token:
         headers["Authorization"] = f"Bearer {gh_token}"
 
-    resp = requests.get(GITHUB_SEARCH_API, params=params, headers=headers, timeout=30)
+    resp = requests.get(
+        GITHUB_SEARCH_API, params=params, headers=headers, timeout=30
+    )
     resp.raise_for_status()
     items = resp.json().get("items", [])
 
@@ -107,7 +110,7 @@ def fetch_yearly_hot_repos(count=5):
 
 
 def fetch_readme(repo_name):
-    """获取仓库 README 内容（截取前 3000 字符避免 token 过长）"""
+    """获取仓库 README 内容（截取前 1500 字符）"""
     headers = {
         "Accept": "application/vnd.github.v3.raw",
         "User-Agent": "GitHub-Trending-Notifier",
@@ -120,52 +123,99 @@ def fetch_readme(repo_name):
     try:
         resp = requests.get(url, headers=headers, timeout=15)
         if resp.status_code == 200:
-            return resp.text[:3000]
+            return resp.text[:1500]
     except Exception:
         pass
     return ""
 
 
-def ai_summarize(repo_name, description, readme_content):
-    """调用 AI 接口生成中文项目概要"""
+def ai_batch_summarize(repos, max_retries=3):
+    """批量调用 AI 接口，一次性为多个项目生成中文概要"""
     api_key = os.environ.get("AI_API_KEY")
     api_base = os.environ.get("AI_API_BASE", "https://api.openai.com/v1")
     ai_model = os.environ.get("AI_MODEL", "gpt-4o-mini")
 
     if not api_key:
-        return f"*{description}*"
+        return {repo["name"]: repo["description"] for repo in repos}
 
-    prompt = f"""请根据以下 GitHub 项目信息，用中文给出简洁的项目概要（100-150字），包含：
-1. 主要功能
-2. 技术栈
-3. 应用场景
-
-项目名：{repo_name}
-项目描述：{description}
-README 摘录：
-{readme_content[:2000]}
+    projects_text = ""
+    for i, repo in enumerate(repos, 1):
+        readme = fetch_readme(repo["name"])
+        projects_text += f"""
+---
+项目 {i}：{repo['name']}
+描述：{repo['description']}
+语言：{repo.get('language', '未知')}
+README 摘录：{readme[:800] if readme else '无'}
+---
 """
 
-    try:
-        resp = requests.post(
-            f"{api_base}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": ai_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 300,
-                "temperature": 0.7,
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        print(f"  AI 概要生成失败({repo_name}): {e}")
-        return f"*{description}*"
+    prompt = f"""你是一个技术项目分析助手。请对以下 {len(repos)} 个 GitHub 项目分别给出中文概要。
+
+要求：
+- 每个项目的概要 80-120 字
+- 包含：主要功能、技术栈、适用场景
+- 以 JSON 数组格式返回，每个元素是一个字符串（对应每个项目的概要）
+- 只返回 JSON 数组，不要其他内容
+
+项目列表：
+{projects_text}
+
+请返回一个包含 {len(repos)} 个元素的 JSON 数组："""
+
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(
+                f"{api_base}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": ai_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 2000,
+                    "temperature": 0.7,
+                },
+                timeout=60,
+            )
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"].strip()
+
+            # 提取 JSON 数组（兼容 markdown 代码块包裹的情况）
+            if "```" in content:
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+                content = content.strip()
+
+            summaries = json.loads(content)
+            if isinstance(summaries, list) and len(summaries) >= len(repos):
+                return {
+                    repos[i]["name"]: summaries[i]
+                    for i in range(len(repos))
+                }
+            print(f"  AI 返回数量不匹配，期望 {len(repos)} 个，得到 {len(summaries)} 个")
+
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                wait_time = 15 * (attempt + 1)
+                print(f"  触发频率限制，等待 {wait_time} 秒后重试 ({attempt + 1}/{max_retries})...")
+                time.sleep(wait_time)
+            else:
+                print(f"  AI 调用失败: {e}")
+                break
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
+            print(f"  AI 返回解析失败: {e}")
+            break
+        except Exception as e:
+            print(f"  AI 调用异常: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(10)
+            else:
+                break
+
+    return {repo["name"]: repo["description"] for repo in repos}
 
 
 def format_message(trending_repos, yearly_repos):
@@ -175,7 +225,6 @@ def format_message(trending_repos, yearly_repos):
 
     lines = [f"# {title}\n"]
 
-    # 今日热门 Top 10
     lines.append("## 今日 Trending Top 10\n")
     for i, repo in enumerate(trending_repos, 1):
         lines.append(f"### {i}. [{repo['name']}]({repo['url']})\n")
@@ -184,7 +233,6 @@ def format_message(trending_repos, yearly_repos):
         lines.append(f"- 今日 Star：{repo['stars_today']}")
         lines.append("")
 
-    # 近一年热门随机推荐
     lines.append("---\n")
     lines.append("## 近一年热门项目随机推荐\n")
     for i, repo in enumerate(yearly_repos, 1):
@@ -231,21 +279,26 @@ def main():
     yearly_repos = fetch_yearly_hot_repos(count=5)
     print(f"  随机选取 {len(yearly_repos)} 个年度热门项目")
 
-    # 3. AI 生成概要（每次调用间隔 8 秒，避免触发智谱免费版频率限制）
-    print("正在生成 AI 概要...")
-    all_repos = trending_repos + yearly_repos
-    for idx, repo in enumerate(all_repos):
-        print(f"  处理: {repo['name']}")
-        readme = fetch_readme(repo["name"])
-        repo["summary"] = ai_summarize(repo["name"], repo["description"], readme)
-        if idx < len(all_repos) - 1:
-            time.sleep(8)
+    # 3. AI 批量生成概要（仅 2 次 API 调用，避免频率限制）
+    print("正在批量生成 AI 概要...")
+
+    print("  [1/2] 处理今日 Trending 项目...")
+    trending_summaries = ai_batch_summarize(trending_repos)
+    for repo in trending_repos:
+        repo["summary"] = trending_summaries.get(repo["name"], repo["description"])
+
+    time.sleep(15)
+
+    print("  [2/2] 处理年度推荐项目...")
+    yearly_summaries = ai_batch_summarize(yearly_repos)
+    for repo in yearly_repos:
+        repo["summary"] = yearly_summaries.get(repo["name"], repo["description"])
 
     # 4. 格式化并推送
     title, content = format_message(trending_repos, yearly_repos)
     print(f"\n标题：{title}")
     print("---")
-    print(content[:500] + "...(截断)")
+    print(content[:800] + "\n...(截断)")
     print("---")
 
     print("\n正在推送到微信...")
