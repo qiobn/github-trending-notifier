@@ -168,10 +168,10 @@ def ai_batch_summarize(repos, max_retries=3):
                 json={
                     "model": ai_model,
                     "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 1500,
+                    "max_tokens": 3000,
                     "temperature": 0.7,
                 },
-                timeout=60,
+                timeout=90,
             )
             resp.raise_for_status()
             content = resp.json()["choices"][0]["message"]["content"].strip()
@@ -289,27 +289,20 @@ def main():
     yearly_repos = fetch_yearly_hot_repos(count=5)
     print(f"  随机选取 {len(yearly_repos)} 个年度热门项目")
 
-    # 3. AI 批量生成概要（分 3 批，每批 5 个，间隔 20 秒）
+    # 3. AI 批量生成概要（OpenRouter 限流宽松，分 2 批，间隔 5 秒）
     print("正在批量生成 AI 概要...")
 
-    print("  [1/3] Trending 1-5...")
-    batch1 = ai_batch_summarize(trending_repos[:5])
-    for repo in trending_repos[:5]:
+    print("  [1/2] Trending Top 10...")
+    batch1 = ai_batch_summarize(trending_repos)
+    for repo in trending_repos:
         repo["summary"] = batch1.get(repo["name"], repo["description"])
 
-    time.sleep(20)
+    time.sleep(5)
 
-    print("  [2/3] Trending 6-10...")
-    batch2 = ai_batch_summarize(trending_repos[5:])
-    for repo in trending_repos[5:]:
-        repo["summary"] = batch2.get(repo["name"], repo["description"])
-
-    time.sleep(20)
-
-    print("  [3/3] 年度推荐项目...")
-    batch3 = ai_batch_summarize(yearly_repos)
+    print("  [2/2] 年度推荐项目...")
+    batch2 = ai_batch_summarize(yearly_repos)
     for repo in yearly_repos:
-        repo["summary"] = batch3.get(repo["name"], repo["description"])
+        repo["summary"] = batch2.get(repo["name"], repo["description"])
 
     # 4. 格式化并推送
     title, content = format_message(trending_repos, yearly_repos)
