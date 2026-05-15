@@ -9,6 +9,7 @@ GitHub Trending 每日推送脚本
 import os
 import random
 import sys
+import time
 from datetime import datetime, timedelta
 
 import requests
@@ -230,17 +231,15 @@ def main():
     yearly_repos = fetch_yearly_hot_repos(count=5)
     print(f"  随机选取 {len(yearly_repos)} 个年度热门项目")
 
-    # 3. AI 生成概要
+    # 3. AI 生成概要（每次调用间隔 4 秒，避免触发频率限制）
     print("正在生成 AI 概要...")
-    for repo in trending_repos:
+    all_repos = trending_repos + yearly_repos
+    for idx, repo in enumerate(all_repos):
         print(f"  处理: {repo['name']}")
         readme = fetch_readme(repo["name"])
         repo["summary"] = ai_summarize(repo["name"], repo["description"], readme)
-
-    for repo in yearly_repos:
-        print(f"  处理: {repo['name']}")
-        readme = fetch_readme(repo["name"])
-        repo["summary"] = ai_summarize(repo["name"], repo["description"], readme)
+        if idx < len(all_repos) - 1:
+            time.sleep(4)
 
     # 4. 格式化并推送
     title, content = format_message(trending_repos, yearly_repos)
