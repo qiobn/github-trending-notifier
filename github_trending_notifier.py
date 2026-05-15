@@ -130,7 +130,7 @@ def fetch_readme(repo_name):
 
 
 def ai_batch_summarize(repos, max_retries=3):
-    """批量调用 AI 接口，一次性为多个项目生成中文概要"""
+    """批量调用 AI 接口，一次性为多个项目生成中文概要（最多 5 个一批）"""
     api_key = os.environ.get("AI_API_KEY")
     api_base = os.environ.get("AI_API_BASE", "https://api.openai.com/v1")
     ai_model = os.environ.get("AI_MODEL", "gpt-4o-mini")
@@ -141,27 +141,21 @@ def ai_batch_summarize(repos, max_retries=3):
     projects_text = ""
     for i, repo in enumerate(repos, 1):
         readme = fetch_readme(repo["name"])
-        projects_text += f"""
----
-项目 {i}：{repo['name']}
-描述：{repo['description']}
-语言：{repo.get('language', '未知')}
-README 摘录：{readme[:800] if readme else '无'}
----
-"""
+        projects_text += (
+            f"\n【项目{i}】{repo['name']}\n"
+            f"描述：{repo['description']}\n"
+            f"README：{readme[:600] if readme else '无'}\n"
+        )
 
-    prompt = f"""你是一个技术项目分析助手。请对以下 {len(repos)} 个 GitHub 项目分别给出中文概要。
+    prompt = f"""请对以下{len(repos)}个GitHub项目各写一句中文概要（50-80字），涵盖功能、技术栈、应用场景。
 
-要求：
-- 每个项目的概要 80-120 字
-- 包含：主要功能、技术栈、适用场景
-- 以 JSON 数组格式返回，每个元素是一个字符串（对应每个项目的概要）
-- 只返回 JSON 数组，不要其他内容
+严格按格式返回，每行一个，格式为"序号. 概要内容"，如：
+1. 这是第一个项目的概要...
+2. 这是第二个项目的概要...
 
-项目列表：
 {projects_text}
 
-请返回一个包含 {len(repos)} 个元素的 JSON 数组："""
+请输出{len(repos)}行概要："""
 
     for attempt in range(max_retries):
         try:
@@ -174,44 +168,60 @@ README 摘录：{readme[:800] if readme else '无'}
                 json={
                     "model": ai_model,
                     "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 2000,
+                    "max_tokens": 1500,
                     "temperature": 0.7,
                 },
                 timeout=60,
             )
             resp.raise_for_status()
             content = resp.json()["choices"][0]["message"]["content"].strip()
+            print(f"  AI 返回内容长度: {len(content)} 字符")
 
-            # 提取 JSON 数组（兼容 markdown 代码块包裹的情况）
-            if "```" in content:
-                content = content.split("```")[1]
-                if content.startswith("json"):
-                    content = content[4:]
-                content = content.strip()
+            # 解析编号列表格式 "1. xxx\n2. xxx\n..."
+            summaries = []
+            for line in content.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                # 去掉开头的序号 "1. " "2. " 等
+                for prefix_len in range(1, 4):
+                    prefix = line[:prefix_len + 2]
+                    if prefix.endswith(". ") or prefix.endswith("．"):
+                        line = line[prefix_len + 2:].strip()
+                        break
+                    elif prefix.endswith("."):
+                        line = line[prefix_len + 1:].strip()
+                        break
+                if line:
+                    summaries.append(line)
 
-            summaries = json.loads(content)
-            if isinstance(summaries, list) and len(summaries) >= len(repos):
+            if len(summaries) >= len(repos):
                 return {
                     repos[i]["name"]: summaries[i]
                     for i in range(len(repos))
                 }
-            print(f"  AI 返回数量不匹配，期望 {len(repos)} 个，得到 {len(summaries)} 个")
+            elif summaries:
+                print(f"  部分解析成功: {len(summaries)}/{len(repos)}")
+                result = {}
+                for i in range(len(repos)):
+                    if i < len(summaries):
+                        result[repos[i]["name"]] = summaries[i]
+                    else:
+                        result[repos[i]["name"]] = repos[i]["description"]
+                return result
 
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 429:
-                wait_time = 15 * (attempt + 1)
+                wait_time = 20 * (attempt + 1)
                 print(f"  触发频率限制，等待 {wait_time} 秒后重试 ({attempt + 1}/{max_retries})...")
                 time.sleep(wait_time)
             else:
                 print(f"  AI 调用失败: {e}")
                 break
-        except (json.JSONDecodeError, KeyError, IndexError) as e:
-            print(f"  AI 返回解析失败: {e}")
-            break
         except Exception as e:
             print(f"  AI 调用异常: {e}")
             if attempt < max_retries - 1:
-                time.sleep(10)
+                time.sleep(15)
             else:
                 break
 
@@ -279,20 +289,27 @@ def main():
     yearly_repos = fetch_yearly_hot_repos(count=5)
     print(f"  随机选取 {len(yearly_repos)} 个年度热门项目")
 
-    # 3. AI 批量生成概要（仅 2 次 API 调用，避免频率限制）
+    # 3. AI 批量生成概要（分 3 批，每批 5 个，间隔 20 秒）
     print("正在批量生成 AI 概要...")
 
-    print("  [1/2] 处理今日 Trending 项目...")
-    trending_summaries = ai_batch_summarize(trending_repos)
-    for repo in trending_repos:
-        repo["summary"] = trending_summaries.get(repo["name"], repo["description"])
+    print("  [1/3] Trending 1-5...")
+    batch1 = ai_batch_summarize(trending_repos[:5])
+    for repo in trending_repos[:5]:
+        repo["summary"] = batch1.get(repo["name"], repo["description"])
 
-    time.sleep(15)
+    time.sleep(20)
 
-    print("  [2/2] 处理年度推荐项目...")
-    yearly_summaries = ai_batch_summarize(yearly_repos)
+    print("  [2/3] Trending 6-10...")
+    batch2 = ai_batch_summarize(trending_repos[5:])
+    for repo in trending_repos[5:]:
+        repo["summary"] = batch2.get(repo["name"], repo["description"])
+
+    time.sleep(20)
+
+    print("  [3/3] 年度推荐项目...")
+    batch3 = ai_batch_summarize(yearly_repos)
     for repo in yearly_repos:
-        repo["summary"] = yearly_summaries.get(repo["name"], repo["description"])
+        repo["summary"] = batch3.get(repo["name"], repo["description"])
 
     # 4. 格式化并推送
     title, content = format_message(trending_repos, yearly_repos)
