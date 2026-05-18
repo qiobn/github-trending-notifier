@@ -156,6 +156,49 @@ def reconstruct_abstract(inverted_index):
     return " ".join(word for _, word in word_positions)
 
 
+def _repair_json_quotes(s):
+    """把 JSON 字符串值内部未转义的 " 替换成中文引号，避免解析失败"""
+    import re
+
+    out = []
+    i = 0
+    in_string = False
+    while i < len(s):
+        ch = s[i]
+        if not in_string:
+            out.append(ch)
+            if ch == '"':
+                in_string = True
+            i += 1
+            continue
+        # 在字符串内部
+        if ch == "\\":
+            out.append(ch)
+            if i + 1 < len(s):
+                out.append(s[i + 1])
+                i += 2
+            else:
+                i += 1
+            continue
+        if ch == '"':
+            # 看下一个非空白字符判断是不是真的字符串结束
+            j = i + 1
+            while j < len(s) and s[j] in " \t\n\r":
+                j += 1
+            if j < len(s) and s[j] in ',:}]':
+                out.append(ch)
+                in_string = False
+                i += 1
+            else:
+                # 字符串内部的 "，替换成中文引号
+                out.append("”" if "“" not in "".join(out[-30:]) else "“")
+                i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _call_ai(prompt, api_key, api_base, model, retry_on_429=True):
     """统一的 AI 调用封装（返回 content 字符串或抛异常）"""
     payload = {
@@ -191,14 +234,16 @@ def ai_translate_batch(articles):
         print("  未配置 AI_API_KEY，跳过翻译")
         return
 
-    # 主模型 + 多个 fallback 备用模型（OpenRouter 免费层）
+    # 主模型 + 多个 fallback 备用模型（已验证当前 OpenRouter 真实存在的免费模型）
     primary_model = os.environ.get("AI_MODEL", "deepseek/deepseek-v4-flash:free")
     fallback_models = [
         primary_model,
-        "qwen/qwen-2.5-72b-instruct:free",
+        "z-ai/glm-4.5-air:free",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "qwen/qwen3-next-80b-a3b-instruct:free",
         "meta-llama/llama-3.3-70b-instruct:free",
-        "google/gemini-2.0-flash-exp:free",
-        "mistralai/mistral-small-3.1-24b-instruct:free",
+        "qwen/qwen3-coder:free",
+        "nousresearch/hermes-3-llama-3.1-405b:free",
     ]
     # 去重保持顺序
     seen = set()
@@ -220,7 +265,8 @@ def ai_translate_batch(articles):
 - 必须严格按 JSON 格式输出，禁止输出任何解释、思考过程或前后缀
 - 输出必须是包含 {len(articles)} 个对象的 JSON 数组
 - 每个对象包含 "id"（文章编号 1-{len(articles)}）、"title_zh"（中文标题）、"abstract_zh"（中文摘要）字段
-- 如果原摘要为"无"，abstract_zh 填 "暂无摘要"
+- 如果原摘要为「无」，abstract_zh 填「暂无摘要」
+- 翻译内容中如需引号，必须使用中文引号「」或『』，绝对不要使用英文双引号 "
 
 输出格式示例：
 [
@@ -240,16 +286,30 @@ def ai_translate_batch(articles):
                 content = _call_ai(prompt, api_key, api_base, model)
                 print(f"    AI 返回内容长度: {len(content)} 字符")
 
-                json_match = re.search(r'\[\s*\{.*?\}\s*\]', content, re.DOTALL)
-                if not json_match:
-                    print(f"    未能提取 JSON 数组，前 200 字: {content[:200]}")
-                    break  # 内容不规范，换下个模型
+                # 尝试匹配 ```json ... ``` 包裹和裸 JSON 数组两种格式
+                cleaned = content
+                code_block_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', content, re.DOTALL)
+                if code_block_match:
+                    cleaned = code_block_match.group(1)
+                else:
+                    # 找第一个 [ 到最后一个 ]，最大化 JSON 范围
+                    start = cleaned.find("[")
+                    end = cleaned.rfind("]")
+                    if start != -1 and end > start:
+                        cleaned = cleaned[start : end + 1]
 
                 try:
-                    items = json.loads(json_match.group(0))
-                except json.JSONDecodeError:
-                    print(f"    JSON 解析失败")
-                    break
+                    items = json.loads(cleaned)
+                except json.JSONDecodeError as e:
+                    # 兜底：把 JSON 字段值内部出现的非转义 " 转成中文引号后重试
+                    repaired = _repair_json_quotes(cleaned)
+                    try:
+                        items = json.loads(repaired)
+                        print(f"    JSON 修复后解析成功")
+                    except json.JSONDecodeError:
+                        print(f"    JSON 解析失败: {e}")
+                        print(f"    返回前 300 字: {content[:300]}")
+                        break  # 换下个模型
 
                 for item in items:
                     if not isinstance(item, dict):

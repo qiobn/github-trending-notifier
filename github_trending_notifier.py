@@ -129,6 +129,44 @@ def fetch_readme(repo_name):
     return ""
 
 
+def _repair_json_quotes(s):
+    """把 JSON 字符串值内部未转义的 " 替换成中文引号，避免解析失败"""
+    out = []
+    i = 0
+    in_string = False
+    while i < len(s):
+        ch = s[i]
+        if not in_string:
+            out.append(ch)
+            if ch == '"':
+                in_string = True
+            i += 1
+            continue
+        if ch == "\\":
+            out.append(ch)
+            if i + 1 < len(s):
+                out.append(s[i + 1])
+                i += 2
+            else:
+                i += 1
+            continue
+        if ch == '"':
+            j = i + 1
+            while j < len(s) and s[j] in " \t\n\r":
+                j += 1
+            if j < len(s) and s[j] in ',:}]':
+                out.append(ch)
+                in_string = False
+                i += 1
+            else:
+                out.append("”")
+                i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def ai_batch_summarize(repos, max_retries=3):
     """批量调用 AI 接口，使用 JSON 格式严格匹配项目与概要"""
     import re
@@ -156,6 +194,7 @@ def ai_batch_summarize(repos, max_retries=3):
 - 必须严格按照 JSON 格式输出，禁止输出任何解释、思考过程或前后缀
 - 输出必须是包含 {len(repos)} 个对象的 JSON 数组
 - 每个对象包含 "id"（项目编号 1 到 {len(repos)}）和 "summary"（中文概要）字段
+- 概要内容中如需引号，必须使用中文引号「」或『』，绝对不要使用英文双引号 "
 
 输出格式示例：
 [
@@ -168,13 +207,15 @@ def ai_batch_summarize(repos, max_retries=3):
 
 请直接输出 JSON 数组，不要任何其他文字："""
 
-    # 主模型 + 多个 fallback 备用模型（OpenRouter 免费层）
+    # 主模型 + 多个 fallback 备用模型（已验证当前 OpenRouter 真实存在的免费模型）
     fallback_models = [
         ai_model,
-        "qwen/qwen-2.5-72b-instruct:free",
+        "z-ai/glm-4.5-air:free",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "qwen/qwen3-next-80b-a3b-instruct:free",
         "meta-llama/llama-3.3-70b-instruct:free",
-        "google/gemini-2.0-flash-exp:free",
-        "mistralai/mistral-small-3.1-24b-instruct:free",
+        "qwen/qwen3-coder:free",
+        "nousresearch/hermes-3-llama-3.1-405b:free",
     ]
     seen = set()
     models_to_try = [m for m in fallback_models if not (m in seen or seen.add(m))]
@@ -205,16 +246,28 @@ def ai_batch_summarize(repos, max_retries=3):
                 content = resp.json()["choices"][0]["message"]["content"].strip()
                 print(f"    AI 返回内容长度: {len(content)} 字符")
 
-                json_match = re.search(r'\[\s*\{.*?\}\s*\]', content, re.DOTALL)
-                if not json_match:
-                    print(f"    未能提取 JSON 数组")
-                    break
+                # 尝试匹配 ```json ... ``` 包裹和裸 JSON 数组两种格式
+                cleaned = content
+                code_block_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', content, re.DOTALL)
+                if code_block_match:
+                    cleaned = code_block_match.group(1)
+                else:
+                    start = cleaned.find("[")
+                    end = cleaned.rfind("]")
+                    if start != -1 and end > start:
+                        cleaned = cleaned[start : end + 1]
 
                 try:
-                    items = json.loads(json_match.group(0))
-                except json.JSONDecodeError:
-                    print(f"    JSON 解析失败")
-                    break
+                    items = json.loads(cleaned)
+                except json.JSONDecodeError as e:
+                    repaired = _repair_json_quotes(cleaned)
+                    try:
+                        items = json.loads(repaired)
+                        print(f"    JSON 修复后解析成功")
+                    except json.JSONDecodeError:
+                        print(f"    JSON 解析失败: {e}")
+                        print(f"    返回前 300 字: {content[:300]}")
+                        break
 
                 result = {}
                 for item in items:
