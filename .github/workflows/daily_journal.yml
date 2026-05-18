@@ -1,10 +1,19 @@
-name: GitHub Trending 每日推送
+name: 期刊文献每日推送
 
 on:
   schedule:
     # UTC 22:00 = 北京时间次日 06:00
     - cron: "0 22 * * *"
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "推送模式（latest=最新3篇 / daily=每天3篇追溯 / both=合并）"
+        required: false
+        default: "both"
+      issn:
+        description: "期刊 ISSN（默认 Cities: 0264-2751）"
+        required: false
+        default: "0264-2751"
 
 jobs:
   notify:
@@ -21,11 +30,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run trending notifier
+      - name: Run journal tracker
         env:
           SERVERCHAN_SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
           AI_API_BASE: ${{ secrets.AI_API_BASE }}
           AI_MODEL: ${{ secrets.AI_MODEL }}
-        run: python github_trending_notifier.py
+          JOURNAL_NAME: "Cities"
+        run: |
+          python journal_tracker.py "${{ github.event.inputs.mode || 'both' }}" "${{ github.event.inputs.issn || '0264-2751' }}"
