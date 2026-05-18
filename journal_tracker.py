@@ -156,17 +156,53 @@ def reconstruct_abstract(inverted_index):
     return " ".join(word for _, word in word_positions)
 
 
-def ai_translate_batch(articles, max_retries=3):
-    """批量翻译标题和摘要为中文（JSON+id 格式，避免错位）"""
+def _call_ai(prompt, api_key, api_base, model, retry_on_429=True):
+    """统一的 AI 调用封装（返回 content 字符串或抛异常）"""
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 4000,
+        "temperature": 0.3,
+    }
+    if "openrouter" in api_base:
+        payload["reasoning"] = {"enabled": False}
+
+    resp = requests.post(
+        f"{api_base}/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=90,
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"].strip()
+
+
+def ai_translate_batch(articles):
+    """批量翻译标题和摘要为中文（JSON+id 格式，多模型 fallback）"""
     import re
 
     api_key = os.environ.get("AI_API_KEY")
     api_base = os.environ.get("AI_API_BASE", "https://openrouter.ai/api/v1")
-    ai_model = os.environ.get("AI_MODEL", "deepseek/deepseek-v4-flash:free")
 
     if not api_key:
         print("  未配置 AI_API_KEY，跳过翻译")
         return
+
+    # 主模型 + 多个 fallback 备用模型（OpenRouter 免费层）
+    primary_model = os.environ.get("AI_MODEL", "deepseek/deepseek-v4-flash:free")
+    fallback_models = [
+        primary_model,
+        "qwen/qwen-2.5-72b-instruct:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "google/gemini-2.0-flash-exp:free",
+        "mistralai/mistral-small-3.1-24b-instruct:free",
+    ]
+    # 去重保持顺序
+    seen = set()
+    models_to_try = [m for m in fallback_models if not (m in seen or seen.add(m))]
 
     items_text = ""
     for i, article in enumerate(articles, 1):
@@ -197,71 +233,51 @@ def ai_translate_batch(articles, max_retries=3):
 
 请直接输出 JSON 数组，不要任何其他文字："""
 
-    for attempt in range(max_retries):
-        try:
-            payload = {
-                "model": ai_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 4000,
-                "temperature": 0.3,
-            }
-            if "openrouter" in api_base:
-                payload["reasoning"] = {"enabled": False}
-
-            resp = requests.post(
-                f"{api_base}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=90,
-            )
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"].strip()
-            print(f"  AI 返回内容长度: {len(content)} 字符")
-
-            json_match = re.search(r'\[\s*\{.*?\}\s*\]', content, re.DOTALL)
-            if not json_match:
-                print(f"  未能从返回中提取 JSON 数组")
-                print(f"  原始前 200 字: {content[:200]}")
-                if attempt < max_retries - 1:
-                    time.sleep(5)
-                    continue
-                return
-
+    for model_idx, model in enumerate(models_to_try):
+        print(f"  尝试模型 [{model_idx + 1}/{len(models_to_try)}]: {model}")
+        for attempt in range(2):  # 每个模型最多重试 2 次
             try:
-                items = json.loads(json_match.group(0))
-            except json.JSONDecodeError as e:
-                print(f"  JSON 解析失败: {e}")
-                if attempt < max_retries - 1:
+                content = _call_ai(prompt, api_key, api_base, model)
+                print(f"    AI 返回内容长度: {len(content)} 字符")
+
+                json_match = re.search(r'\[\s*\{.*?\}\s*\]', content, re.DOTALL)
+                if not json_match:
+                    print(f"    未能提取 JSON 数组，前 200 字: {content[:200]}")
+                    break  # 内容不规范，换下个模型
+
+                try:
+                    items = json.loads(json_match.group(0))
+                except json.JSONDecodeError:
+                    print(f"    JSON 解析失败")
+                    break
+
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    idx = item.get("id")
+                    if isinstance(idx, int) and 1 <= idx <= len(articles):
+                        articles[idx - 1]["title_zh"] = (item.get("title_zh") or "").strip()
+                        articles[idx - 1]["abstract_zh"] = (item.get("abstract_zh") or "").strip()
+
+                translated = sum(1 for a in articles if a.get("title_zh"))
+                if translated > 0:
+                    print(f"  AI 翻译完成：{translated}/{len(articles)} 篇（模型: {model}）")
+                    return
+
+            except requests.exceptions.HTTPError as e:
+                status = e.response.status_code if e.response else None
+                if status == 429:
+                    print(f"    {model} 限流（429），切换备用模型")
+                    break  # 立即换下个模型
+                else:
+                    print(f"    HTTP {status} 错误，等待 5 秒后重试")
                     time.sleep(5)
-                    continue
-                return
+            except Exception as e:
+                print(f"    调用异常: {e}")
+                if attempt == 0:
+                    time.sleep(3)
 
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                idx = item.get("id")
-                if isinstance(idx, int) and 1 <= idx <= len(articles):
-                    articles[idx - 1]["title_zh"] = (item.get("title_zh") or "").strip()
-                    articles[idx - 1]["abstract_zh"] = (item.get("abstract_zh") or "").strip()
-
-            translated = sum(1 for a in articles if a.get("title_zh"))
-            print(f"  AI 翻译完成：{translated}/{len(articles)} 篇")
-            return
-
-        except requests.exceptions.HTTPError as e:
-            wait_time = 10 * (attempt + 1)
-            print(f"  AI 调用失败: {e}，等待 {wait_time} 秒后重试 ({attempt + 1}/{max_retries})")
-            if attempt < max_retries - 1:
-                time.sleep(wait_time)
-        except Exception as e:
-            print(f"  AI 异常: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(5)
-            else:
-                return
+    print("  所有模型均失败，跳过翻译")
 
 
 def select_articles(articles, mode="latest", count=3, days_back=5):

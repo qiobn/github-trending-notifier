@@ -168,84 +168,86 @@ def ai_batch_summarize(repos, max_retries=3):
 
 请直接输出 JSON 数组，不要任何其他文字："""
 
-    for attempt in range(max_retries):
-        try:
-            payload = {
-                "model": ai_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 3000,
-                "temperature": 0.3,
-            }
-            # OpenRouter: 关闭推理模型的思考输出
-            if "openrouter" in api_base:
-                payload["reasoning"] = {"enabled": False}
+    # 主模型 + 多个 fallback 备用模型（OpenRouter 免费层）
+    fallback_models = [
+        ai_model,
+        "qwen/qwen-2.5-72b-instruct:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "google/gemini-2.0-flash-exp:free",
+        "mistralai/mistral-small-3.1-24b-instruct:free",
+    ]
+    seen = set()
+    models_to_try = [m for m in fallback_models if not (m in seen or seen.add(m))]
 
-            resp = requests.post(
-                f"{api_base}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=90,
-            )
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"].strip()
-            print(f"  AI 返回内容长度: {len(content)} 字符")
-
-            # 提取 JSON 数组（容忍 markdown 代码块包裹）
-            json_match = re.search(r'\[\s*\{.*?\}\s*\]', content, re.DOTALL)
-            if not json_match:
-                print(f"  未能从返回内容中提取 JSON 数组")
-                print(f"  原始内容前 200 字: {content[:200]}")
-                if attempt < max_retries - 1:
-                    time.sleep(5)
-                    continue
-                break
-
+    for model_idx, model in enumerate(models_to_try):
+        print(f"  尝试模型 [{model_idx + 1}/{len(models_to_try)}]: {model}")
+        for attempt in range(2):
             try:
-                items = json.loads(json_match.group(0))
-            except json.JSONDecodeError as e:
-                print(f"  JSON 解析失败: {e}")
-                if attempt < max_retries - 1:
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 3000,
+                    "temperature": 0.3,
+                }
+                if "openrouter" in api_base:
+                    payload["reasoning"] = {"enabled": False}
+
+                resp = requests.post(
+                    f"{api_base}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=90,
+                )
+                resp.raise_for_status()
+                content = resp.json()["choices"][0]["message"]["content"].strip()
+                print(f"    AI 返回内容长度: {len(content)} 字符")
+
+                json_match = re.search(r'\[\s*\{.*?\}\s*\]', content, re.DOTALL)
+                if not json_match:
+                    print(f"    未能提取 JSON 数组")
+                    break
+
+                try:
+                    items = json.loads(json_match.group(0))
+                except json.JSONDecodeError:
+                    print(f"    JSON 解析失败")
+                    break
+
+                result = {}
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    idx = item.get("id")
+                    summary = item.get("summary", "").strip()
+                    if isinstance(idx, int) and 1 <= idx <= len(repos) and summary:
+                        result[repos[idx - 1]["name"]] = summary
+
+                for repo in repos:
+                    if repo["name"] not in result:
+                        result[repo["name"]] = repo["description"]
+
+                matched = sum(1 for r in repos if result.get(r["name"]) != r["description"])
+                if matched > 0:
+                    print(f"  成功匹配概要: {matched}/{len(repos)} 个项目（模型: {model}）")
+                    return result
+
+            except requests.exceptions.HTTPError as e:
+                status = e.response.status_code if e.response else None
+                if status == 429:
+                    print(f"    {model} 限流（429），切换备用模型")
+                    break
+                else:
+                    print(f"    HTTP {status} 错误，等待 5 秒后重试")
                     time.sleep(5)
-                    continue
-                break
+            except Exception as e:
+                print(f"    调用异常: {e}")
+                if attempt == 0:
+                    time.sleep(3)
 
-            # 用 id 严格匹配项目，避免错位
-            result = {}
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                idx = item.get("id")
-                summary = item.get("summary", "").strip()
-                if isinstance(idx, int) and 1 <= idx <= len(repos) and summary:
-                    result[repos[idx - 1]["name"]] = summary
-
-            # 补全未匹配的项目
-            for repo in repos:
-                if repo["name"] not in result:
-                    result[repo["name"]] = repo["description"]
-
-            matched = sum(1 for r in repos if result.get(r["name"]) != r["description"])
-            print(f"  成功匹配概要: {matched}/{len(repos)} 个项目")
-            return result
-
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 429:
-                wait_time = 20 * (attempt + 1)
-                print(f"  触发频率限制，等待 {wait_time} 秒后重试 ({attempt + 1}/{max_retries})...")
-                time.sleep(wait_time)
-            else:
-                print(f"  AI 调用失败: {e}")
-                break
-        except Exception as e:
-            print(f"  AI 调用异常: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(15)
-            else:
-                break
-
+    print("  所有模型均失败，回退为英文描述")
     return {repo["name"]: repo["description"] for repo in repos}
 
 
